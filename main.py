@@ -9545,9 +9545,200 @@ def run_auth() -> None:
     client.disconnect()
 
 
+
+async def run_auth_qr() -> None:
+    """Optional Telegram login with a QR code; the rest of v0042 is unchanged."""
+    import getpass
+    import qrcode
+    from qrcode.constants import ERROR_CORRECT_L
+
+    s = store.settings
+    if not (s.api_id and s.api_hash and s.phone):
+        raise RuntimeError("Сначала укажи TG_API_ID, TG_API_HASH и номер телефона через бота")
+
+    session = MTProtoService.session_base()
+    client = TelegramClient(
+        session,
+        int(s.api_id),
+        str(s.api_hash),
+        device_model=f"Gift Hunter {SHOOTER_ID} VPS",
+        system_version="Linux",
+        app_version=APP_VERSION,
+        lang_code="ru",
+        system_lang_code="ru-RU",
+    )
+    qr_path = DATA_DIR / "auth_qr_TEMPORARY.png"
+    qr_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        await client.connect()
+        if await client.is_user_authorized():
+            me = await client.get_me()
+            print(f"Уже авторизован: {utils.get_display_name(me)} (id={me.id})", flush=True)
+            return
+
+        print("QR-вход: открой ВТОРОЙ аккаунт Telegram -> Настройки -> Устройства -> Подключить устройство.", flush=True)
+        print("Сканируй код с ДРУГОГО экрана; каждый QR действует ограниченное время.", flush=True)
+        print("Никому не отправляй QR-код: он даёт доступ к сеансу входа.", flush=True)
+        for attempt in range(1, 9):
+            qr_login = await client.qr_login()
+            code = qrcode.QRCode(error_correction=ERROR_CORRECT_L, box_size=8, border=2)
+            code.add_data(qr_login.url)
+            code.make(fit=True)
+            code.make_image(fill_color="black", back_color="white").save(qr_path)
+            print(f"\nQR-код {attempt}/8; PNG в контейнере: {qr_path}", flush=True)
+            # Half-height Unicode blocks: one terminal character per QR column,
+            # two QR rows per terminal line. Better suited to phone terminals.
+            matrix = code.get_matrix()
+            if len(matrix) % 2:
+                matrix.append([False] * len(matrix[0]))
+            for upper, lower in zip(matrix[::2], matrix[1::2]):
+                chars = ''.join(
+                    '█' if u and l else '▀' if u else '▄' if l else ' '
+                    for u, l in zip(upper, lower)
+                )
+                print(chars, flush=True)
+            try:
+                await qr_login.wait(timeout=28)
+            except errors.SessionPasswordNeededError:
+                password = getpass.getpass("Пароль 2FA второго аккаунта: ")
+                await client.sign_in(password=password)
+            except asyncio.TimeoutError:
+                print("QR истёк. Обновляю QR-код...", flush=True)
+                continue
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                print(f"Авторизация успешна: {utils.get_display_name(me)} (id={me.id})", flush=True)
+                return
+        raise RuntimeError("QR-вход не завершён: запусти команду auth_qr ещё раз")
+    finally:
+        with contextlib.suppress(OSError):
+            qr_path.unlink(missing_ok=True)
+        await client.disconnect()
+
+
+async def run_auth_link() -> None:
+    """One-phone QR-token link login; never publish the token or touch another deployment.
+
+    Uses a fresh staging session, then atomically installs it into *this* app's
+    chosen MT_SESSION path. Prevents collisions with a live unauthorized client.
+    """
+    import getpass
+    import secrets
+    import sqlite3
+
+    s = store.settings
+    if not (s.api_id and s.api_hash and s.phone):
+        raise RuntimeError("Сначала укажи TG_API_ID, TG_API_HASH и телефон второго аккаунта через бота")
+
+    session_base = MTProtoService.session_base()
+    target = Path(session_base + ".session")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.is_symlink():
+        raise RuntimeError("Небезопасный путь сессии: символическая ссылка")
+
+    def new_client(path: str) -> TelegramClient:
+        return TelegramClient(
+            path, int(s.api_id), str(s.api_hash),
+            device_model=f"Gift Hunter {SHOOTER_ID} VPS",
+            system_version="Linux", app_version=APP_VERSION,
+            lang_code="ru", system_lang_code="ru-RU",
+        )
+
+    # Safety guard: do not replace an already authorized account if the
+    # command is run in the wrong Coolify container.
+    if target.exists():
+        existing = new_client(session_base)
+        try:
+            await existing.connect()
+            if await existing.is_user_authorized():
+                me = await existing.get_me()
+                print(f"Здесь уже авторизован аккаунт id={me.id}. Сессия не изменена.", flush=True)
+                print("Если нужен другой аккаунт, сначала убедись, что выбрал именно ВТОРОЙ контейнер.", flush=True)
+                return
+        except Exception as exc:
+            raise RuntimeError("Не удалось безопасно проверить текущую сессию; перенос отменён") from exc
+        finally:
+            await existing.disconnect()
+
+    staged_base = str(target.parent / f".link_login_{os.getpid()}_{secrets.token_hex(4)}")
+    staged_file = Path(staged_base + ".session")
+    client = new_client(staged_base)
+    succeeded = False
+    me_id = None
+    try:
+        await client.connect()
+        print("ВХОД ПО ССЫЛКЕ. Открывай её ТОЛЬКО со своего второго аккаунта Telegram.", flush=True)
+        print("Ссылка действует примерно 30 секунд. Она конфиденциальная!", flush=True)
+        print("Если Telegram не покажет подтверждение, вход с одного телефона не поддержался.", flush=True)
+        print("Не отправляй ссылку в переписку, в поддержку или сюда в чат.", flush=True)
+        for attempt in range(1, 13):
+            qr = await client.qr_login()
+            print(f"\n===== ССЫЛКА ДЛЯ ВХОДА ({attempt}/12) =====", flush=True)
+            print(qr.url, flush=True)
+            print("========================================", flush=True)
+            print("Скопируй ссылку и попробуй открыть на телефоне в Telegram.", flush=True)
+            try:
+                await qr.wait(timeout=25)
+            except errors.SessionPasswordNeededError:
+                pwd = getpass.getpass("Введите облачный пароль 2FA в Termius (не в чате): ")
+                await client.sign_in(password=pwd)
+                del pwd
+            except asyncio.TimeoutError:
+                print("Срок ссылки истёк. Создаю новую...", flush=True)
+                continue
+            if await client.is_user_authorized():
+                me = await client.get_me()
+                # Multi-account Android clients may accept the token using the
+                # wrong Telegram account. Never install such a session.
+                configured_phone = re.sub(r"\D", "", str(s.phone))
+                authorized_phone = re.sub(r"\D", "", str(getattr(me, "phone", "") or ""))
+                if not configured_phone or authorized_phone != configured_phone:
+                    raise RuntimeError(
+                        "Подтверждён ДРУГОЙ Telegram-аккаунт или нельзя проверить номер. "
+                        "Сессия второго бота НЕ заменена! Выбери второй аккаунт в Telegram."
+                    )
+                me_id = me.id
+                succeeded = True
+                break
+        if not succeeded:
+            raise RuntimeError("Вход не подтверждён. Попробуй QR-вход с экрана ноутбука: auth_qr")
+    finally:
+        await client.disconnect()
+        if not succeeded:
+            with contextlib.suppress(OSError):
+                staged_file.unlink(missing_ok=True)
+
+    # SQLite must be closed before moving the newly authorized session.
+    # Do not overwrite an existing session unless it has been backed up.
+    try:
+        conn = sqlite3.connect(f"file:{staged_file}?mode=ro", uri=True)
+        try:
+            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise RuntimeError("Новая сессия повреждена; перенос отменён")
+            if conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] < 1:
+                raise RuntimeError("Новая сессия пуста; перенос отменён")
+        finally:
+            conn.close()
+        if target.exists():
+            backup = target.with_name(target.name + ".backup_before_link")
+            if backup.exists():
+                raise RuntimeError("Резервная копия уже существует. Старую сессию не перезаписываем")
+            shutil.copy2(target, backup)
+            os.chmod(backup, 0o600)
+            print(f"Резервная копия прежней сессии сохранена в {backup.name}", flush=True)
+        os.replace(staged_file, target)
+        os.chmod(target, 0o600)
+    except Exception:
+        with contextlib.suppress(OSError):
+            staged_file.unlink(missing_ok=True)
+        raise
+    print(f"УСПЕХ: новый Telegram-аккаунт id={me_id} авторизован и сохранён: {target.name}", flush=True)
+    print("Перезапусти ТОЛЬКО второй сервис Coolify, чтобы его бот перечитал сессию.", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=f"{APP_NAME} {APP_VERSION}")
-    parser.add_argument("command", nargs="?", default="bot", choices=["bot", "auth", "version"])
+    parser.add_argument("command", nargs="?", default="bot", choices=["bot", "auth", "auth_qr", "auth_link", "version"])
     return parser.parse_args()
 
 
@@ -9556,6 +9747,12 @@ def main() -> None:
     args = parse_args()
     if args.command == "auth":
         run_auth()
+        return
+    if args.command == "auth_qr":
+        asyncio.run(run_auth_qr())
+        return
+    if args.command == "auth_link":
+        asyncio.run(run_auth_link())
         return
     if args.command == "version":
         print(f"{APP_NAME} {APP_VERSION}")
